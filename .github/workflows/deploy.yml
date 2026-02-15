@@ -1,0 +1,85 @@
+name: Deploy - Deploy to VM
+
+on:
+  workflow_run:
+    workflows: ["CD - Build and Push Images"]
+    types:
+      - completed
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to Production VM
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to VM via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          envs: GITHUB_TOKEN,DB_PASSWORD,JWT_SECRET,OPENAI_API_KEY,TWILIO_ACCOUNT_SID,TWILIO_AUTH_TOKEN,SMTP_USERNAME,SMTP_PASSWORD
+          script: |
+            # Navigate to app directory
+            cd /opt/insurance-app || exit 1
+
+            # Pull latest code
+            git pull origin main
+
+            # Update .env file with secrets
+            cat > .env << EOF
+            DB_PASSWORD=${DB_PASSWORD}
+            JWT_SECRET=${JWT_SECRET}
+            OPENAI_API_KEY=${OPENAI_API_KEY}
+            TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}
+            TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}
+            SMTP_USERNAME=${SMTP_USERNAME}
+            SMTP_PASSWORD=${SMTP_PASSWORD}
+            VOICE_MOCK_MODE=false
+            SPRING_PROFILES_ACTIVE=prod
+            EOF
+
+            # Login to GitHub Container Registry
+            echo ${GITHUB_TOKEN} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # Pull latest images
+            docker-compose pull
+
+            # Restart services
+            docker-compose down
+            docker-compose up -d
+
+            # Clean up old images
+            docker image prune -af
+
+            # Check service health
+            sleep 30
+            docker-compose ps
+            curl -f http://localhost:8080/actuator/health || exit 1
+
+            echo "Deployment completed successfully!"
+
+      - name: Notify deployment status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ Deployment succeeded"
+          else
+            echo "❌ Deployment failed"
+          fi
